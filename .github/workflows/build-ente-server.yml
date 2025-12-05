@@ -1,24 +1,76 @@
 name: Build and Push Ente Server
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ main ]
-  workflow_dispatch: 
+    main
   schedule:
-    - cron: '0 1 * * *'
+    - cron: '0 2 * * *' 
 
 jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      commit_sha: ${{ steps.check.outputs.commit_sha }}
+      run_id: ${{ steps.check.outputs.run_id }}
+    permissions:
+      contents: read
+      
+    steps:
+      - name: Check latest upstream workflow run
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get the latest successful run of server-release.yml
+          latest_run=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            /repos/ente-io/ente/actions/workflows/server-release.yml/runs \
+            --jq '.workflow_runs | map(select(.conclusion == "success")) | first')
+          
+          commit_sha=$(echo "$latest_run" | jq -r '.head_sha')
+          run_id=$(echo "$latest_run" | jq -r '.id')
+          updated_at=$(echo "$latest_run" | jq -r '.updated_at')
+          
+          echo "Latest successful run:"
+          echo "  Run ID: $run_id"
+          echo "  Commit: $commit_sha"
+          echo "  Updated: $updated_at"
+          
+          # Check if we've already built this commit
+          # Query GitHub Container Registry for existing image with this commit
+          package_exists=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            /users/${{ github.repository_owner }}/packages/container/ente-server/versions \
+            --jq "map(select(.metadata.container.tags[] | contains(\"${commit_sha:0:7}\"))) | length" 2>/dev/null || echo "0")
+          
+          if [ "$package_exists" -gt 0 ]; then
+            echo "Image for commit $commit_sha already exists, skipping build"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "New commit detected: $commit_sha"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "commit_sha=$commit_sha" >> $GITHUB_OUTPUT
+            echo "run_id=$run_id" >> $GITHUB_OUTPUT
+          fi
+
   build-and-push:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
       
     steps:
-      - name: Checkout ente repository
+      - name: Checkout ente repository at specific commit
         uses: actions/checkout@v4
         with:
           repository: ente-io/ente
+          ref: ${{ needs.check-upstream.outputs.commit_sha }}
           
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -37,7 +89,12 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/ente-server
           tags: |
             type=raw,value=latest
-            type=sha,prefix={{date 'YYYYMMDD'}}-
+            type=raw,value=${{ needs.check-upstream.outputs.commit_sha }}
+            type=raw,value={{date 'YYYYMMDD'}}-${{ needs.check-upstream.outputs.commit_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/ente-io/ente
+            org.opencontainers.image.revision=${{ needs.check-upstream.outputs.commit_sha }}
+            upstream.workflow.run_id=${{ needs.check-upstream.outputs.run_id }}
             
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -48,3 +105,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          
+      - name: Output build info
+        run: |
+          echo "Built and pushed image for commit: ${{ needs.check-upstream.outputs.commit_sha }}"
+          echo "Upstream workflow run: https://github.com/ente-io/ente/actions/runs/${{ needs.check-upstream.outputs.run_id }}"
