@@ -3,7 +3,7 @@ name: Build and Push Ente Server
 on:
   workflow_dispatch:
   push:
-    main
+    - main
   schedule:
     - cron: '0 2 * * *' 
 
